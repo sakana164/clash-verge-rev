@@ -1,5 +1,6 @@
 use crate::utils::{dirs, help};
 use anyhow::Result;
+use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use std::{
@@ -32,7 +33,6 @@ impl IClashTemp {
     pub fn template() -> Self {
         let mut map = Mapping::new();
         let mut tun = Mapping::new();
-        let mut cors_map = Mapping::new();
         tun.insert("enable".into(), false.into());
         tun.insert("stack".into(), "gvisor".into());
         tun.insert("auto-route".into(), true.into());
@@ -50,7 +50,10 @@ impl IClashTemp {
         map.insert("allow-lan".into(), false.into());
         map.insert("ipv6".into(), true.into());
         map.insert("mode".into(), "rule".into());
-        map.insert("external-controller".into(), "127.0.0.1:9097".into());
+        map.insert("external-controller".into(), "127.0.0.1:0".into());
+        map.insert("secret".into(), "".into());
+
+        let mut cors_map = Mapping::new();
         cors_map.insert("allow-private-network".into(), true.into());
         cors_map.insert(
             "allow-origins".into(),
@@ -61,14 +64,33 @@ impl IClashTemp {
             ]
             .into(),
         );
-        map.insert("secret".into(), "".into());
-        map.insert("tun".into(), tun.into());
         map.insert("external-controller-cors".into(), cors_map.into());
+        map.insert("tun".into(), tun.into());
         map.insert("unified-delay".into(), true.into());
         Self(map)
     }
 
+    // 生成随机端口（动态端口范围：1111-65535）
+    fn generate_random_port() -> u16 {
+        let mut rng = OsRng;
+        rng.gen_range(1111..=65535)
+    }
+
+    // 生成32位强密码（包含大小写字母、数字、特殊符号）
+    fn generate_secret() -> String {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;':\",.<>/?`~";
+        let mut rng = OsRng;
+        (0..32)
+            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .collect()
+    }
+
     fn guard(mut config: Mapping) -> Mapping {
+        // 生成随机控制器端口和密钥
+        let ctrl_port = Self::generate_random_port();
+        let ctrl_addr = format!("127.0.0.1:{}", ctrl_port);
+        let secret = Self::generate_secret();
+
         #[cfg(not(target_os = "windows"))]
         let redir_port = Self::guard_redir_port(&config);
         #[cfg(target_os = "linux")]
@@ -76,7 +98,11 @@ impl IClashTemp {
         let mixed_port = Self::guard_mixed_port(&config);
         let socks_port = Self::guard_socks_port(&config);
         let port = Self::guard_port(&config);
-        let ctrl = Self::guard_server_ctrl(&config);
+
+        // 注入随机值
+        config.insert("external-controller".into(), Value::String(ctrl_addr));
+        config.insert("secret".into(), Value::String(secret));
+
         #[cfg(not(target_os = "windows"))]
         config.insert("redir-port".into(), redir_port.into());
         #[cfg(target_os = "linux")]
@@ -84,7 +110,6 @@ impl IClashTemp {
         config.insert("mixed-port".into(), mixed_port.into());
         config.insert("socks-port".into(), socks_port.into());
         config.insert("port".into(), port.into());
-        config.insert("external-controller".into(), ctrl.into());
 
         // 强制覆盖 external-controller-cors 字段，允许本地和 tauri 前端
         let mut cors_map = Mapping::new();
@@ -337,6 +362,33 @@ fn test_clash_info() {
         get_case(8888, "192.168.1.1:80800"),
         get_result(8888, "127.0.0.1:9097")
     );
+}
+
+// 验证随机生成
+#[test]
+fn test_random_config() {
+    let config = IClashTemp::template();
+    let guarded = IClashTemp::guard(config.0.clone());
+
+    // 验证端口有效性
+    let ctrl_addr = guarded
+        .get("external-controller")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    let (ip_str, port_str) = ctrl_addr.split_once(':').unwrap();
+    assert_eq!(ip_str, "127.0.0.1");
+    let port: u16 = port_str.parse().unwrap();
+    assert!(port >= 1111 && port <= 65535);
+
+    // 验证密钥强度
+    let secret = guarded.get("secret").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(secret.len(), 32);
+    assert!(secret.chars().any(|c| c.is_uppercase()));
+    assert!(secret.chars().any(|c| c.is_lowercase()));
+    assert!(secret.chars().any(|c| c.is_numeric()));
+    assert!(secret
+        .chars()
+        .any(|c| "!@#$%^&*()_+-=[]{}|;':\",.<>/?`~".contains(c)));
 }
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
